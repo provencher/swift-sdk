@@ -216,4 +216,93 @@ struct ServerTests {
         await clientTransport.disconnect()
         await serverTransport.disconnect()
     }
+
+    @Test("Response send failure after handler success is single-attempt and terminal")
+    func testResponseSendFailureAfterHandlerSuccessDoesNotSendSecondError() async throws {
+        let transport = MockTransport()
+        await transport.setFailOnSendAttempt(1)
+
+        let server = Server(name: "TestServer", version: "1.0")
+        try await server.start(transport: transport)
+
+        try await transport.queue(request: Ping.request(id: .number(1)))
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(await transport.sendAttempts == 1)
+        #expect(await transport.sentMessages.isEmpty)
+        #expect(await transport.isConnected == false)
+
+        await server.stop()
+    }
+
+    @Test("Batch response send failure is single-attempt and terminal")
+    func testBatchResponseSendFailureIsSingleAttemptAndTerminal() async throws {
+        let transport = MockTransport()
+        await transport.setFailOnSendAttempt(1)
+
+        let server = Server(name: "TestServer", version: "1.0")
+        try await server.start(transport: transport)
+
+        let batchJSON = """
+            [
+                {"jsonrpc":"2.0","id":1,"method":"ping","params":{}},
+                {"jsonrpc":"2.0","id":2,"method":"ping","params":{}}
+            ]
+            """
+        await transport.queue(data: batchJSON.data(using: .utf8)!)
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(await transport.sendAttempts == 1)
+        #expect(await transport.sentMessages.isEmpty)
+        #expect(await transport.isConnected == false)
+
+        await server.stop()
+    }
+
+    @Test("Parse error response send failure closes transport")
+    func testParseErrorResponseSendFailureClosesTransport() async throws {
+        let transport = MockTransport()
+        await transport.setFailOnSendAttempt(1)
+
+        let server = Server(name: "TestServer", version: "1.0")
+        try await server.start(transport: transport)
+
+        await transport.queue(data: Data("not-json".utf8))
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(await transport.sendAttempts == 1)
+        #expect(await transport.sentMessages.isEmpty)
+        #expect(await transport.isConnected == false)
+
+        await server.stop()
+    }
+
+    @Test("Response send failure prevents later request handling")
+    func testResponseSendFailurePreventsLaterRequestHandling() async throws {
+        actor Counter {
+            private(set) var count = 0
+            func increment() { count += 1 }
+        }
+
+        let counter = Counter()
+        let transport = MockTransport()
+        await transport.setFailOnSendAttempt(1)
+
+        let server = Server(name: "TestServer", version: "1.0")
+        await server.withMethodHandler(ListTools.self) { _ in
+            await counter.increment()
+            return ListTools.Result(tools: [])
+        }
+        try await transport.queue(request: ListTools.request(id: .number(1), .init()))
+        try await transport.queue(request: ListTools.request(id: .number(2), .init()))
+
+        try await server.start(transport: transport)
+        try await Task.sleep(for: .milliseconds(300))
+
+        #expect(await counter.count == 1)
+        #expect(await transport.sendAttempts == 1)
+        #expect(await transport.isConnected == false)
+
+        await server.stop()
+    }
 }

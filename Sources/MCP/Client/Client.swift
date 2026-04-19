@@ -5,6 +5,28 @@ import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
+private actor PendingRegistrationSignal {
+    private var isComplete = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isComplete { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func complete() {
+        guard !isComplete else { return }
+        isComplete = true
+        let waiters = waiters
+        self.waiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
 /// Model Context Protocol client
 public actor Client {
     /// The client configuration
@@ -181,6 +203,8 @@ public actor Client {
 
     /// A dictionary of type-erased pending requests, keyed by request ID
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
+    /// Terminal connection error once the receive loop exits or disconnect begins.
+    private var terminalError: MCPError?
     // Add reusable JSON encoder/decoder
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -206,6 +230,7 @@ public actor Client {
     @discardableResult
     public func connect(transport: any Transport) async throws -> Initialize.Result {
         self.connection = transport
+        self.terminalError = nil
         try await self.connection?.connect()
 
         await logger?.debug(
@@ -244,15 +269,31 @@ public actor Client {
                             )
                         }
                     }
+                    break
                 } catch let error where MCPError.isResourceTemporarilyUnavailable(error) {
                     try? await Task.sleep(for: .milliseconds(10))
                     continue
                 } catch {
                     await logger?.error(
-                        "Error in message handling loop", metadata: ["error": "\(error)"])
+                        "Error in message handling loop",
+                        metadata: [
+                            "provenance": "transport_close_no_response",
+                            "error": "\(error)",
+                        ]
+                    )
+                    await self.drainPendingRequests(
+                        throwing: Self.pendingRequestDrainError(forReceiveError: error),
+                        provenance: "transport_close_no_response",
+                        markTerminal: true
+                    )
                     break
                 }
             } while true
+            await self.drainPendingRequests(
+                throwing: MCPError.connectionClosed,
+                provenance: "transport_close_no_response",
+                markTerminal: true
+            )
             await self.logger?.debug("Client message handling loop task is terminating.")
         }
 
@@ -290,19 +331,17 @@ public actor Client {
         // Part 1: Inside actor - Grab state and clear internal references
         let taskToCancel = self.task
         let connectionToDisconnect = self.connection
-        let pendingRequestsToCancel = self.pendingRequests
 
         self.task = nil
         self.connection = nil
-        self.pendingRequests = [:]  // Use empty dictionary literal
 
         // Part 2: Outside actor - Resume continuations, disconnect transport, await task
 
-        // Resume continuations first
-        for (_, request) in pendingRequestsToCancel {
-            request.resume(throwing: MCPError.internalError("Client disconnected"))
-        }
-        await logger?.debug("Pending requests cancelled.")
+        await drainPendingRequests(
+            throwing: MCPError.connectionClosed,
+            provenance: "explicit_disconnect",
+            markTerminal: true
+        )
 
         // Cancel the task
         taskToCancel?.cancel()
@@ -352,6 +391,9 @@ public actor Client {
 
     /// Send a notification to the server
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
+        if let terminalError {
+            throw terminalError
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
@@ -390,6 +432,9 @@ public actor Client {
     /// - Throws: MCPError if the client is not connected
     /// - SeeAlso: https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation
     public func send<M: Method>(_ request: Request<M>) throws -> RequestContext<M.Result> {
+        if let terminalError {
+            throw terminalError
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
@@ -400,11 +445,14 @@ public actor Client {
             try await withCheckedThrowingContinuation { continuation in
                 Task {
                     // Add the pending request before attempting to send
-                    self.addPendingRequest(
+                    if let terminalError = self.addPendingRequest(
                         id: request.id,
                         continuation: continuation,
                         type: M.Result.self
-                    )
+                    ) {
+                        continuation.resume(throwing: terminalError)
+                        return
+                    }
 
                     // Send the request data
                     do {
@@ -468,14 +516,63 @@ public actor Client {
         id: ID,
         continuation: CheckedContinuation<T, Swift.Error>,
         type: T.Type  // Keep type for AnyPendingRequest internal logic
-    ) {
+    ) -> MCPError? {
+        if let terminalError {
+            return terminalError
+        }
         pendingRequests[id] = AnyPendingRequest(
             PendingRequest(continuation: continuation)
         )
+        return nil
     }
 
     private func removePendingRequest(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
+    }
+
+    private func failPendingRequests(ids: [ID], throwing error: Swift.Error) {
+        for id in ids {
+            if let pendingRequest = removePendingRequest(id: id) {
+                pendingRequest.resume(throwing: error)
+            }
+        }
+    }
+
+    private static func pendingRequestDrainError(forReceiveError error: Swift.Error) -> MCPError {
+        if let mcpError = error as? MCPError {
+            return mcpError
+        }
+        return MCPError.transportError(error)
+    }
+
+    private func drainPendingRequests(
+        throwing error: MCPError,
+        provenance: String,
+        markTerminal: Bool
+    ) async {
+        if markTerminal, terminalError == nil {
+            terminalError = error
+        }
+
+        let pendingRequestsToDrain = pendingRequests
+        pendingRequests = [:]
+
+        guard !pendingRequestsToDrain.isEmpty else {
+            return
+        }
+
+        for (_, request) in pendingRequestsToDrain {
+            request.resume(throwing: error)
+        }
+
+        await logger?.debug(
+            "Pending requests drained",
+            metadata: [
+                "provenance": "\(provenance)",
+                "count": "\(pendingRequestsToDrain.count)",
+                "error": "\(error)",
+            ]
+        )
     }
 
     // MARK: - Batching
@@ -498,23 +595,32 @@ public actor Client {
         public func addRequest<M: Method>(_ request: Request<M>) async throws -> Task<
             M.Result, Swift.Error
         > {
-            requests.append(try AnyRequest(request))
+            let anyRequest = try AnyRequest(request)
+            let registration = PendingRegistrationSignal()
 
-            // Return a Task that registers the pending request and awaits its result.
-            // The continuation is resumed when the response arrives.
-            return Task<M.Result, Swift.Error> {
+            // Return a Task that awaits the response. `addRequest` waits for the
+            // continuation to be registered before returning, so `withBatch` cannot
+            // send before pendingRequests contains this request ID.
+            let task = Task<M.Result, Swift.Error> {
                 try await withCheckedThrowingContinuation { continuation in
                     // We are already inside a Task, but need another Task
                     // to bridge to the client actor's context.
                     Task {
-                        await client.addPendingRequest(
+                        if let terminalError = await client.addPendingRequest(
                             id: request.id,
                             continuation: continuation,
                             type: M.Result.self
-                        )
+                        ) {
+                            continuation.resume(throwing: terminalError)
+                        }
+                        await registration.complete()
                     }
                 }
             }
+
+            await registration.wait()
+            requests.append(anyRequest)
+            return task
         }
     }
 
@@ -593,6 +699,9 @@ public actor Client {
     /// - Throws: `MCPError.internalError` if the client is not connected.
     ///           Can also rethrow errors from the `body` closure or from sending the batch request.
     public func withBatch(body: @escaping @Sendable (Batch) async throws -> Void) async throws {
+        if let terminalError {
+            throw terminalError
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Client connection not initialized")
         }
@@ -606,6 +715,11 @@ public actor Client {
         // Get the collected requests from the batch actor
         let requests = await batch.requests
 
+        if let terminalError {
+            failPendingRequests(ids: requests.map(\.id), throwing: terminalError)
+            throw terminalError
+        }
+
         // Check if there are any requests to send
         guard !requests.isEmpty else {
             await logger?.debug("Batch requested but no requests were added.")
@@ -615,9 +729,15 @@ public actor Client {
         await logger?.debug(
             "Sending batch request", metadata: ["count": "\(requests.count)"])
 
-        // Encode the array of AnyMethod requests into a single JSON payload
-        let data = try encoder.encode(requests)
-        try await connection.send(data)
+        // Encode and send the array of AnyMethod requests into a single JSON payload.
+        // If delivery fails, fail all already-registered batch continuations.
+        do {
+            let data = try encoder.encode(requests)
+            try await connection.send(data)
+        } catch {
+            failPendingRequests(ids: requests.map(\.id), throwing: error)
+            throw error
+        }
 
         // Responses will be handled asynchronously by the message loop and handleBatchResponse/handleResponse.
     }
@@ -972,6 +1092,15 @@ public actor Client {
             case .success(let value):
                 removedRequest.resume(returning: value)
             case .failure(let error):
+                await logger?.debug(
+                    "Received server JSON-RPC error response",
+                    metadata: [
+                        "provenance": "server_jsonrpc_error",
+                        "id": "\(response.id)",
+                        "code": "\(error.code)",
+                        "error": "\(error)",
+                    ]
+                )
                 removedRequest.resume(throwing: error)
             }
         } else {
@@ -1076,6 +1205,15 @@ public actor Client {
                 case .success(let value):
                     pendingRequest.resume(returning: value)
                 case .failure(let error):
+                    await logger?.debug(
+                        "Received server JSON-RPC error response in batch",
+                        metadata: [
+                            "provenance": "server_jsonrpc_error",
+                            "id": "\(response.id)",
+                            "code": "\(error.code)",
+                            "error": "\(error)",
+                        ]
+                    )
                     pendingRequest.resume(throwing: error)
                 }
             } else {

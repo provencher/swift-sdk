@@ -170,6 +170,17 @@ public actor Server {
 
     /// Pending requests sent to the client, awaiting responses
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
+    /// Terminal flag set after response delivery fails or stop begins.
+    private var isClosing = false
+
+    private struct ResponseSendContext: Sendable {
+        let phase: String
+        let requestID: ID?
+        let method: String?
+        let toolName: String?
+        let responseCount: Int
+        let startedAt: Date
+    }
 
     /// Whether the server is initialized
     private var isInitialized = false
@@ -183,6 +194,8 @@ public actor Server {
     private var subscriptions: [String: Set<ID>] = [:]
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
+    /// Serializes incoming request handler dispatch while keeping the receive loop responsive.
+    private var requestDispatchTail: Task<Void, Never>?
 
     public init(
         name: String,
@@ -207,6 +220,7 @@ public actor Server {
         initializeHook: (@Sendable (Client.Info, Client.Capabilities) async throws -> Void)? = nil
     ) async throws {
         self.connection = transport
+        self.isClosing = false
         registerDefaultHandlers(initializeHook: initializeHook)
         registerCancellationHandler()
         try await transport.connect()
@@ -219,22 +233,23 @@ public actor Server {
         task = Task {
             do {
                 let stream = await transport.receive()
-                for try await data in stream {
-                    if Task.isCancelled { break }  // Check cancellation inside loop
+                messageLoop: for try await data in stream {
+                    if Task.isCancelled || self.isClosing { break }  // Check cancellation inside loop
 
+                    let startedAt = Date()
                     var requestID: ID?
                     do {
                         // Attempt to decode as batch first, then as individual response, request, or notification
                         let decoder = JSONDecoder()
                         if let batch = try? decoder.decode(Server.Batch.self, from: data) {
-                            try await handleBatch(batch)
+                            let shouldContinue = await handleBatch(batch, startedAt: startedAt)
+                            if !shouldContinue { break messageLoop }
                         } else if let response = try? decoder.decode(AnyResponse.self, from: data) {
                             await handleResponse(response)
                         } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
-                            // Handle request in a separate task to avoid blocking the receive loop
-                            Task {
-                                _ = try? await self.handleRequest(request, sendResponse: true)
-                            }
+                            // Queue request handling so already-buffered requests cannot start
+                            // after an earlier response delivery failure closes this connection.
+                            enqueueRequest(request, startedAt: startedAt)
                         } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
                             try await handleMessage(message)
                         } else {
@@ -263,12 +278,38 @@ public actor Server {
                             error: error as? MCPError
                                 ?? MCPError.internalError(error.localizedDescription)
                         )
-                        try? await send(response)
+                        let sent = await sendResponse(
+                            response,
+                            context: ResponseSendContext(
+                                phase: "parse_error_response",
+                                requestID: requestID,
+                                method: nil,
+                                toolName: nil,
+                                responseCount: 1,
+                                startedAt: startedAt
+                            )
+                        )
+                        if !sent { break messageLoop }
                     }
                 }
             } catch {
                 await logger?.error(
                     "Fatal error in message handling loop", metadata: ["error": "\(error)"])
+                isClosing = true
+                drainPendingResponses(
+                    throwing: error as? MCPError ?? MCPError.transportError(error)
+                )
+                requestDispatchTail?.cancel()
+                requestDispatchTail = nil
+                let tasksToCancel = pendingRequestTasks.values
+                pendingRequestTasks = [:]
+                for task in tasksToCancel {
+                    task.cancel()
+                }
+                if let connection = connection {
+                    await connection.disconnect()
+                }
+                connection = nil
             }
             await logger?.debug("Server finished", metadata: [:])
         }
@@ -276,15 +317,13 @@ public actor Server {
 
     /// Stop the server
     public func stop() async {
+        isClosing = true
         task?.cancel()
         task = nil
+        requestDispatchTail?.cancel()
+        requestDispatchTail = nil
 
-        // Clear pending requests with errors
-        let pendingRequestsToCancel = self.pendingRequests
-        self.pendingRequests = [:]
-        for (_, request) in pendingRequestsToCancel {
-            request.resume(throwing: MCPError.internalError("Server disconnected"))
-        }
+        drainPendingResponses(throwing: MCPError.connectionClosed)
 
         if let connection = connection {
             await connection.disconnect()
@@ -336,6 +375,9 @@ public actor Server {
 
     /// Send a response to a request
     public func send<M: Method>(_ response: Response<M>) async throws {
+        if isClosing {
+            throw MCPError.connectionClosed
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
         }
@@ -347,8 +389,109 @@ public actor Server {
         try await connection.send(responseData)
     }
 
+    private func sendResponse(
+        _ response: Response<AnyMethod>,
+        context: ResponseSendContext
+    ) async -> Bool {
+        let responseData: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            responseData = try encoder.encode(response)
+        } catch {
+            await handleResponseSendFailure(error, context: context, byteCount: nil)
+            return false
+        }
+
+        guard let connection = connection else {
+            await handleResponseSendFailure(MCPError.connectionClosed, context: context, byteCount: responseData.count)
+            return false
+        }
+
+        do {
+            try await connection.send(responseData)
+            return true
+        } catch {
+            await handleResponseSendFailure(error, context: context, byteCount: responseData.count)
+            return false
+        }
+    }
+
+    private func handleResponseSendFailure(
+        _ error: Swift.Error,
+        context: ResponseSendContext,
+        byteCount: Int?
+    ) async {
+        var metadata: Logger.Metadata = [
+            "provenance": "response_send_failed",
+            "phase": "\(context.phase)",
+            "response_count": "\(context.responseCount)",
+            "elapsed_seconds": "\(Date().timeIntervalSince(context.startedAt))",
+            "error": "\(error)",
+        ]
+        if let requestID = context.requestID {
+            metadata["id"] = "\(requestID)"
+        }
+        if let method = context.method {
+            metadata["method"] = "\(method)"
+        }
+        if let toolName = context.toolName {
+            metadata["tool"] = "\(toolName)"
+        }
+        if let byteCount = byteCount {
+            metadata["bytes"] = "\(byteCount)"
+        }
+
+        await logger?.error("Failed to send JSON-RPC response", metadata: metadata)
+
+        isClosing = true
+        drainPendingResponses(throwing: MCPError.connectionClosed)
+
+        requestDispatchTail?.cancel()
+        requestDispatchTail = nil
+        let tasksToCancel = pendingRequestTasks.values
+        pendingRequestTasks = [:]
+        for task in tasksToCancel {
+            task.cancel()
+        }
+
+        if let connection = connection {
+            await connection.disconnect()
+        }
+        connection = nil
+    }
+
+    private func toolName(from request: Request<AnyMethod>) -> String? {
+        guard request.method == CallTool.name,
+            case .object(let params) = request.params
+        else { return nil }
+        return params["name"]?.stringValue
+    }
+
+    private func enqueueRequest(_ request: Request<AnyMethod>, startedAt: Date) {
+        let previous = requestDispatchTail
+        let task = Task {
+            await previous?.value
+            if Task.isCancelled { return }
+            guard self.canDispatchRequest() else { return }
+            _ = await self.handleRequest(
+                request,
+                sendResponse: true,
+                startedAt: startedAt
+            )
+        }
+        requestDispatchTail = task
+    }
+
+    private func canDispatchRequest() -> Bool {
+        return !isClosing
+    }
+
     /// Send a notification to connected clients
     public func notify<N: Notification>(_ notification: Message<N>) async throws {
+        if isClosing {
+            throw MCPError.connectionClosed
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
         }
@@ -362,6 +505,9 @@ public actor Server {
 
     /// Send a request to the client and return a Task for the response
     private func send<M: Method>(_ request: Request<M>) throws -> Task<M.Result, Error> {
+        if isClosing {
+            throw MCPError.connectionClosed
+        }
         guard let connection = connection else {
             throw MCPError.internalError("Server connection not initialized")
         }
@@ -374,11 +520,14 @@ public actor Server {
             try await withCheckedThrowingContinuation { continuation in
                 Task {
                     // Add pending response before sending
-                    self.addPendingResponse(
+                    if let terminalError = self.addPendingResponse(
                         id: request.id,
                         continuation: continuation,
                         type: M.Result.self
-                    )
+                    ) {
+                        continuation.resume(throwing: terminalError)
+                        return
+                    }
 
                     // Send the request
                     do {
@@ -406,14 +555,26 @@ public actor Server {
         id: ID,
         continuation: CheckedContinuation<T, Swift.Error>,
         type: T.Type
-    ) {
+    ) -> MCPError? {
+        if isClosing {
+            return MCPError.connectionClosed
+        }
         pendingRequests[id] = AnyPendingRequest(
             PendingRequest(continuation: continuation)
         )
+        return nil
     }
 
     private func removePendingResponse(id: ID) -> AnyPendingRequest? {
         return pendingRequests.removeValue(forKey: id)
+    }
+
+    private func drainPendingResponses(throwing error: Swift.Error) {
+        let pendingRequestsToDrain = pendingRequests
+        pendingRequests = [:]
+        for (_, request) in pendingRequestsToDrain {
+            request.resume(throwing: error)
+        }
     }
 
     // MARK: - Sampling
@@ -648,15 +809,24 @@ public actor Server {
     }
 
     /// Process a batch of requests and/or notifications
-    private func handleBatch(_ batch: Batch) async throws {
+    private func handleBatch(_ batch: Batch, startedAt: Date = Date()) async -> Bool {
         await logger?.trace("Processing batch request", metadata: ["size": "\(batch.items.count)"])
 
         if batch.items.isEmpty {
             // Empty batch is invalid according to JSON-RPC spec
             let error = MCPError.invalidRequest("Batch array must not be empty")
             let response = AnyMethod.response(id: .random, error: error)
-            try await send(response)
-            return
+            return await sendResponse(
+                response,
+                context: ResponseSendContext(
+                    phase: "batch_error_response",
+                    requestID: nil,
+                    method: nil,
+                    toolName: nil,
+                    responseCount: 1,
+                    startedAt: startedAt
+                )
+            )
         }
 
         // Process each item in the batch and collect responses
@@ -667,7 +837,11 @@ public actor Server {
                 switch item {
                 case .request(let request):
                     // For batched requests, collect responses instead of sending immediately
-                    if let response = try await handleRequest(request, sendResponse: false) {
+                    if let response = await handleRequest(
+                        request,
+                        sendResponse: false,
+                        startedAt: startedAt
+                    ) {
                         responses.append(response)
                     }
 
@@ -685,31 +859,112 @@ public actor Server {
             }
         }
 
-        // Send collected responses if any
+        // Send collected responses if any. A batch has one response-delivery attempt.
         if !responses.isEmpty {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            let responseData = try encoder.encode(responses)
-
-            guard let connection = connection else {
-                throw MCPError.internalError("Server connection not initialized")
+            let responseData: Data
+            do {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                responseData = try encoder.encode(responses)
+            } catch {
+                await handleResponseSendFailure(
+                    error,
+                    context: ResponseSendContext(
+                        phase: "batch_response_encode",
+                        requestID: nil,
+                        method: nil,
+                        toolName: nil,
+                        responseCount: responses.count,
+                        startedAt: startedAt
+                    ),
+                    byteCount: nil
+                )
+                return false
             }
 
-            try await connection.send(responseData)
+            guard let connection = connection else {
+                await handleResponseSendFailure(
+                    MCPError.connectionClosed,
+                    context: ResponseSendContext(
+                        phase: "batch_response",
+                        requestID: nil,
+                        method: nil,
+                        toolName: nil,
+                        responseCount: responses.count,
+                        startedAt: startedAt
+                    ),
+                    byteCount: responseData.count
+                )
+                return false
+            }
+
+            do {
+                try await connection.send(responseData)
+            } catch {
+                await handleResponseSendFailure(
+                    error,
+                    context: ResponseSendContext(
+                        phase: "batch_response",
+                        requestID: nil,
+                        method: nil,
+                        toolName: nil,
+                        responseCount: responses.count,
+                        startedAt: startedAt
+                    ),
+                    byteCount: responseData.count
+                )
+                return false
+            }
         }
+
+        return true
     }
 
     // MARK: - Request and Message Handling
 
-    /// Handle a request and either send the response immediately or return it
+    /// Handle a request and either send the response immediately or return it.
+    ///
+    /// Handler execution and response delivery are intentionally separated so a
+    /// completed handler result is never converted into a second error response
+    /// when the transport fails while sending.
     ///
     /// - Parameters:
     ///   - request: The request to handle
     ///   - sendResponse: Whether to send the response immediately (true) or return it (false)
     /// - Returns: The response when sendResponse is false
-    private func handleRequest(_ request: Request<AnyMethod>, sendResponse: Bool = true)
-        async throws -> Response<AnyMethod>?
-    {
+    private func handleRequest(
+        _ request: Request<AnyMethod>,
+        sendResponse: Bool = true,
+        startedAt: Date = Date()
+    ) async -> Response<AnyMethod>? {
+        let response = await makeResponse(for: request, sendResponse: sendResponse)
+
+        guard let response else {
+            return nil
+        }
+
+        if sendResponse {
+            _ = await self.sendResponse(
+                response,
+                context: ResponseSendContext(
+                    phase: "single_response",
+                    requestID: request.id,
+                    method: request.method,
+                    toolName: toolName(from: request),
+                    responseCount: 1,
+                    startedAt: startedAt
+                )
+            )
+            return nil
+        }
+
+        return response
+    }
+
+    private func makeResponse(
+        for request: Request<AnyMethod>,
+        sendResponse: Bool
+    ) async -> Response<AnyMethod>? {
         // Check if this is a pre-processed error request (empty method)
         if request.method.isEmpty && !sendResponse {
             // This is a placeholder for an invalid request that couldn't be parsed in batch mode
@@ -726,88 +981,71 @@ public actor Server {
                 "id": "\(request.id)",
             ])
 
-        if configuration.strict {
-            // The client SHOULD NOT send requests other than pings
-            // before the server has responded to the initialize request.
-            switch request.method {
-            case Initialize.name, Ping.name:
-                break
-            default:
-                try checkInitialized()
-            }
-        }
-
-        // Find handler for method name
-        guard let handler = methodHandlers[request.method] else {
-            let error = MCPError.methodNotFound("Unknown method: \(request.method)")
-            let response = AnyMethod.response(id: request.id, error: error)
-
-            if sendResponse {
-                try await send(response)
-                return nil
-            }
-
-            return response
-        }
-
-        // Create a task to handle the request with cancellation support.
-        // Set currentRequestID as a task local so handlers can identify the active request.
-        var handlerTask: Task<Response<AnyMethod>, Error>!
-        Server.$currentRequestID.withValue(request.id) {
-            handlerTask = Task<Response<AnyMethod>, Error> {
-                do {
-                    // Check if task was cancelled before starting
-                    try Task.checkCancellation()
-
-                    // Handle request and get response
-                    let response = try await handler(request)
-                    return response
-                } catch is CancellationError {
-                    // Request was cancelled, don't send a response per MCP spec
-                    await logger?.debug(
-                        "Request cancelled",
-                        metadata: ["id": "\(request.id)", "method": "\(request.method)"]
-                    )
-                    throw CancellationError()
-                } catch {
-                    let mcpError =
-                        error as? MCPError ?? MCPError.internalError(error.localizedDescription)
-                    return AnyMethod.response(id: request.id, error: mcpError)
+        do {
+            if configuration.strict {
+                // The client SHOULD NOT send requests other than pings
+                // before the server has responded to the initialize request.
+                switch request.method {
+                case Initialize.name, Ping.name:
+                    break
+                default:
+                    try checkInitialized()
                 }
             }
-        }
 
-        // Store the handler task for potential cancellation
-        pendingRequestTasks[request.id] = handlerTask
-
-        // Ensure cleanup happens regardless of success or failure
-        defer {
-            pendingRequestTasks.removeValue(forKey: request.id)
-        }
-
-        do {
-            let response = try await handlerTask.value
-
-            if sendResponse {
-                try await send(response)
-                return nil
+            // Find handler for method name
+            guard let handler = methodHandlers[request.method] else {
+                let error = MCPError.methodNotFound("Unknown method: \(request.method)")
+                return AnyMethod.response(id: request.id, error: error)
             }
 
-            return response
-        } catch is CancellationError {
-            // Request was cancelled, don't send a response per MCP spec
-            return nil
+            // Create a task to handle the request with cancellation support.
+            // Set currentRequestID as a task local so handlers can identify the active request.
+            let handlerTask = Server.$currentRequestID.withValue(request.id) {
+                Task<Response<AnyMethod>, Error> {
+                    do {
+                        // Check if task was cancelled before starting
+                        try Task.checkCancellation()
+
+                        // Handle request and get response
+                        let response = try await handler(request)
+                        return response
+                    } catch is CancellationError {
+                        // Request was cancelled, don't send a response per MCP spec
+                        await logger?.debug(
+                            "Request cancelled",
+                            metadata: ["id": "\(request.id)", "method": "\(request.method)"]
+                        )
+                        throw CancellationError()
+                    } catch {
+                        let mcpError =
+                            error as? MCPError ?? MCPError.internalError(error.localizedDescription)
+                        return AnyMethod.response(id: request.id, error: mcpError)
+                    }
+                }
+            }
+
+            // Store the handler task for potential cancellation
+            pendingRequestTasks[request.id] = handlerTask
+
+            // Ensure cleanup happens regardless of success or failure
+            defer {
+                pendingRequestTasks.removeValue(forKey: request.id)
+            }
+
+            do {
+                return try await handlerTask.value
+            } catch is CancellationError {
+                // Request was cancelled, don't send a response per MCP spec
+                return nil
+            } catch {
+                // This should not happen as errors are caught in the task
+                let mcpError = error as? MCPError ?? MCPError.internalError(error.localizedDescription)
+                return AnyMethod.response(id: request.id, error: mcpError)
+            }
         } catch {
-            // This should not happen as errors are caught in the task
             let mcpError = error as? MCPError ?? MCPError.internalError(error.localizedDescription)
-            let response = AnyMethod.response(id: request.id, error: mcpError)
-
-            if sendResponse {
-                try await send(response)
-                return nil
-            }
-
-            return response
+            return AnyMethod.response(id: request.id, error: mcpError)
         }
     }
 

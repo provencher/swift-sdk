@@ -514,6 +514,54 @@ struct ClientTests {
         await client.disconnect()
     }
 
+    @Test("Batch send failure resumes registered pending requests")
+    func testBatchSendFailureResumesRegisteredPendingRequests() async throws {
+        let transport = MockTransport()
+        let client = Client(name: "TestClient", version: "1.0")
+        try await connectInitialized(client, transport: transport)
+
+        let request1 = Ping.request(id: .number(2001))
+        let request2 = Ping.request(id: .number(2002))
+        nonisolated(unsafe) var resultTasks: [Task<Ping.Result, Swift.Error>] = []
+
+        await transport.setFailSend(true)
+
+        do {
+            try await client.withBatch { batch in
+                resultTasks.append(try await batch.addRequest(request1))
+                resultTasks.append(try await batch.addRequest(request2))
+            }
+            #expect(Bool(false), "Expected batch send to fail")
+        } catch let error as MCPError {
+            if case .transportError = error {
+                #expect(Bool(true))
+            } else {
+                #expect(Bool(false), "Expected transportError, got \(error)")
+            }
+        }
+
+        #expect(resultTasks.count == 2)
+        for task in resultTasks {
+            let result = await awaitResult {
+                try await task.value
+            }
+            switch result {
+            case .success:
+                #expect(Bool(false), "Expected registered batch task to fail after send failure")
+            case .failure(let error as MCPError):
+                if case .transportError = error {
+                    #expect(Bool(true))
+                } else {
+                    #expect(Bool(false), "Expected transportError, got \(error)")
+                }
+            case .failure(let error):
+                #expect(Bool(false), "Expected MCPError.transportError, got \(error)")
+            }
+        }
+
+        await client.disconnect()
+    }
+
     @Test("Notify method sends notifications")
     func testClientNotify() async throws {
         let transport = MockTransport()
@@ -771,5 +819,174 @@ struct ClientTests {
         // (If it did, the test would have crashed)
 
         await client.disconnect()
+    }
+
+    @Test("Clean receive EOF drains pending requests")
+    func testCleanReceiveEOFDrainsPendingRequests() async throws {
+        let transport = MockTransport()
+        let client = Client(name: "TestClient", version: "1.0")
+        try await connectInitialized(client, transport: transport)
+
+        let context = try await client.send(Ping.request(id: .number(1001)))
+        #expect(await waitForSentMessages(atLeast: 3, transport: transport))
+
+        await transport.finishReceiving()
+
+        let result = await awaitResult {
+            try await context.value
+        }
+
+        switch result {
+        case .success:
+            #expect(Bool(false), "Expected pending request to fail after clean EOF")
+        case .failure(let error as MCPError):
+            #expect(error == .connectionClosed)
+        case .failure(let error):
+            #expect(Bool(false), "Expected MCPError.connectionClosed, got \(error)")
+        }
+
+        do {
+            _ = try await client.send(Ping.request(id: .number(1004)))
+            #expect(Bool(false), "Expected send after clean EOF to fail immediately")
+        } catch let error as MCPError {
+            #expect(error == .connectionClosed)
+        }
+
+        await client.disconnect()
+    }
+
+    @Test("Thrown receive error drains pending requests")
+    func testReceiveErrorDrainsPendingRequests() async throws {
+        let transport = MockTransport()
+        let client = Client(name: "TestClient", version: "1.0")
+        try await connectInitialized(client, transport: transport)
+
+        let context = try await client.send(Ping.request(id: .number(1002)))
+        #expect(await waitForSentMessages(atLeast: 3, transport: transport))
+
+        await transport.failReceiving(with: MCPError.transportError(POSIXError(.ECONNRESET)))
+
+        let result = await awaitResult {
+            try await context.value
+        }
+
+        switch result {
+        case .success:
+            #expect(Bool(false), "Expected pending request to fail after receive error")
+        case .failure(let error as MCPError):
+            if case .transportError = error {
+                #expect(Bool(true))
+            } else {
+                #expect(Bool(false), "Expected transportError, got \(error)")
+            }
+        case .failure(let error):
+            #expect(Bool(false), "Expected MCPError.transportError, got \(error)")
+        }
+
+        do {
+            _ = try await client.send(Ping.request(id: .number(1005)))
+            #expect(Bool(false), "Expected send after receive error to fail immediately")
+        } catch let error as MCPError {
+            if case .transportError = error {
+                #expect(Bool(true))
+            } else {
+                #expect(Bool(false), "Expected transportError, got \(error)")
+            }
+        }
+
+        await client.disconnect()
+    }
+
+    @Test("Explicit disconnect drains pending requests")
+    func testExplicitDisconnectDrainsPendingRequests() async throws {
+        let transport = MockTransport()
+        let client = Client(name: "TestClient", version: "1.0")
+        try await connectInitialized(client, transport: transport)
+
+        let context = try await client.send(Ping.request(id: .number(1003)))
+        #expect(await waitForSentMessages(atLeast: 3, transport: transport))
+
+        await client.disconnect()
+
+        let result = await awaitResult {
+            try await context.value
+        }
+
+        switch result {
+        case .success:
+            #expect(Bool(false), "Expected pending request to fail after disconnect")
+        case .failure(let error as MCPError):
+            #expect(error == .connectionClosed)
+        case .failure(let error):
+            #expect(Bool(false), "Expected MCPError.connectionClosed, got \(error)")
+        }
+    }
+
+    private func connectInitialized(
+        _ client: Client,
+        transport: MockTransport,
+        capabilities: Server.Capabilities = .init()
+    ) async throws {
+        let initTask = Task {
+            for _ in 0..<200 {
+                if let lastMessage = await transport.sentMessages.last,
+                    let data = lastMessage.data(using: .utf8),
+                    let request = try? JSONDecoder().decode(Request<Initialize>.self, from: data)
+                {
+                    let response = Initialize.response(
+                        id: request.id,
+                        result: .init(
+                            protocolVersion: Version.latest,
+                            capabilities: capabilities,
+                            serverInfo: .init(name: "TestServer", version: "1.0"),
+                            instructions: nil
+                        )
+                    )
+                    try? await transport.queue(response: response)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+
+        _ = try await client.connect(transport: transport)
+        initTask.cancel()
+    }
+
+    private func waitForSentMessages(
+        atLeast count: Int,
+        transport: MockTransport,
+        attempts: Int = 100
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if await transport.sentMessages.count >= count {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return await transport.sentMessages.count >= count
+    }
+
+    private func awaitResult<T: Sendable>(
+        timeout: Duration = .milliseconds(500),
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async -> Result<T, Swift.Error> {
+        await withTaskGroup(of: Result<T, Swift.Error>.self) { group in
+            group.addTask {
+                do {
+                    return .success(try await operation())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return .failure(MCPError.internalError("Timed out waiting for pending request drain"))
+            }
+
+            let result = await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 }

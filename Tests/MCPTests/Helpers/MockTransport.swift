@@ -17,6 +17,7 @@ actor MockTransport: Transport {
     var isConnected = false
 
     private(set) var sentData: [Data] = []
+    private(set) var sendAttempts = 0
     var sentMessages: [String] {
         return sentData.compactMap { data in
             guard let string = String(data: data, encoding: .utf8) else {
@@ -31,9 +32,12 @@ actor MockTransport: Transport {
     private(set) var receivedMessages: [String] = []
 
     private var dataStreamContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation?
+    private var shouldFinishOnReceive = false
+    private var receiveErrorOnReceive: MCPError?
 
     var shouldFailConnect = false
     var shouldFailSend = false
+    var failOnSendAttempt: Int?
 
     init(logger: Logger = Logger(label: "mcp.test.transport")) {
         self.logger = logger
@@ -53,7 +57,8 @@ actor MockTransport: Transport {
     }
 
     public func send(_ message: Data) async throws {
-        if shouldFailSend {
+        sendAttempts += 1
+        if shouldFailSend || failOnSendAttempt == sendAttempts {
             throw MCPError.transportError(POSIXError(.EIO))
         }
         sentData.append(message)
@@ -69,6 +74,16 @@ actor MockTransport: Transport {
                 }
             }
             dataToReceive.removeAll()
+
+            if let receiveErrorOnReceive {
+                continuation.finish(throwing: receiveErrorOnReceive)
+                self.receiveErrorOnReceive = nil
+                dataStreamContinuation = nil
+            } else if shouldFinishOnReceive {
+                continuation.finish()
+                shouldFinishOnReceive = false
+                dataStreamContinuation = nil
+            }
         }
     }
 
@@ -78,6 +93,28 @@ actor MockTransport: Transport {
 
     func setFailSend(_ shouldFail: Bool) {
         shouldFailSend = shouldFail
+    }
+
+    func setFailOnSendAttempt(_ attempt: Int?) {
+        failOnSendAttempt = attempt
+    }
+
+    func finishReceiving() {
+        if let continuation = dataStreamContinuation {
+            continuation.finish()
+            dataStreamContinuation = nil
+        } else {
+            shouldFinishOnReceive = true
+        }
+    }
+
+    func failReceiving(with error: MCPError = MCPError.transportError(POSIXError(.EIO))) {
+        if let continuation = dataStreamContinuation {
+            continuation.finish(throwing: error)
+            dataStreamContinuation = nil
+        } else {
+            receiveErrorOnReceive = error
+        }
     }
 
     func queue(data: Data) {
@@ -119,6 +156,7 @@ actor MockTransport: Transport {
 
     func clearMessages() {
         sentData.removeAll()
+        sendAttempts = 0
         dataToReceive.removeAll()
     }
 }

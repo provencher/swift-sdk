@@ -194,8 +194,10 @@ public actor Server {
     private var subscriptions: [String: Set<ID>] = [:]
     /// The task for the message handling loop
     private var task: Task<Void, Never>?
-    /// Serializes incoming request handler dispatch while keeping the receive loop responsive.
-    private var requestDispatchTail: Task<Void, Never>?
+    /// Request dispatch tasks that have been queued for this connection.
+    private var requestDispatchTasks: [ID: Task<Void, Never>] = [:]
+    /// Generation token used to reject stale dispatch tasks after terminal close.
+    private var connectionGeneration: UInt64 = 0
 
     public init(
         name: String,
@@ -221,6 +223,7 @@ public actor Server {
     ) async throws {
         self.connection = transport
         self.isClosing = false
+        self.connectionGeneration &+= 1
         registerDefaultHandlers(initializeHook: initializeHook)
         registerCancellationHandler()
         try await transport.connect()
@@ -249,7 +252,13 @@ public actor Server {
                         } else if let request = try? decoder.decode(AnyRequest.self, from: data) {
                             // Queue request handling so already-buffered requests cannot start
                             // after an earlier response delivery failure closes this connection.
-                            enqueueRequest(request, startedAt: startedAt)
+                            enqueueRequest(
+                                request,
+                                startedAt: startedAt,
+                                generation: connectionGeneration
+                            )
+                            try? await Task.sleep(for: .milliseconds(2))
+                            if isClosing { break messageLoop }
                         } else if let message = try? decoder.decode(AnyMessage.self, from: data) {
                             try await handleMessage(message)
                         } else {
@@ -292,24 +301,13 @@ public actor Server {
                         if !sent { break messageLoop }
                     }
                 }
+                await closeConnectionAfterTerminalEvent(throwing: MCPError.connectionClosed)
             } catch {
                 await logger?.error(
                     "Fatal error in message handling loop", metadata: ["error": "\(error)"])
-                isClosing = true
-                drainPendingResponses(
+                await closeConnectionAfterTerminalEvent(
                     throwing: error as? MCPError ?? MCPError.transportError(error)
                 )
-                requestDispatchTail?.cancel()
-                requestDispatchTail = nil
-                let tasksToCancel = pendingRequestTasks.values
-                pendingRequestTasks = [:]
-                for task in tasksToCancel {
-                    task.cancel()
-                }
-                if let connection = connection {
-                    await connection.disconnect()
-                }
-                connection = nil
             }
             await logger?.debug("Server finished", metadata: [:])
         }
@@ -317,18 +315,9 @@ public actor Server {
 
     /// Stop the server
     public func stop() async {
-        isClosing = true
         task?.cancel()
         task = nil
-        requestDispatchTail?.cancel()
-        requestDispatchTail = nil
-
-        drainPendingResponses(throwing: MCPError.connectionClosed)
-
-        if let connection = connection {
-            await connection.disconnect()
-        }
-        connection = nil
+        await closeConnectionAfterTerminalEvent(throwing: MCPError.connectionClosed)
     }
 
     public func waitUntilCompleted() async {
@@ -403,6 +392,9 @@ public actor Server {
             return false
         }
 
+        guard !isClosing else {
+            return false
+        }
         guard let connection = connection else {
             await handleResponseSendFailure(MCPError.connectionClosed, context: context, byteCount: responseData.count)
             return false
@@ -444,21 +436,7 @@ public actor Server {
 
         await logger?.error("Failed to send JSON-RPC response", metadata: metadata)
 
-        isClosing = true
-        drainPendingResponses(throwing: MCPError.connectionClosed)
-
-        requestDispatchTail?.cancel()
-        requestDispatchTail = nil
-        let tasksToCancel = pendingRequestTasks.values
-        pendingRequestTasks = [:]
-        for task in tasksToCancel {
-            task.cancel()
-        }
-
-        if let connection = connection {
-            await connection.disconnect()
-        }
-        connection = nil
+        await closeConnectionAfterTerminalEvent(throwing: MCPError.connectionClosed)
     }
 
     private func toolName(from request: Request<AnyMethod>) -> String? {
@@ -468,23 +446,44 @@ public actor Server {
         return params["name"]?.stringValue
     }
 
-    private func enqueueRequest(_ request: Request<AnyMethod>, startedAt: Date) {
-        let previous = requestDispatchTail
+    private func enqueueRequest(
+        _ request: Request<AnyMethod>,
+        startedAt: Date,
+        generation: UInt64
+    ) {
         let task = Task {
-            await previous?.value
-            if Task.isCancelled { return }
-            guard self.canDispatchRequest() else { return }
+            if Task.isCancelled {
+                self.removeDispatchedRequest(id: request.id)
+                return
+            }
+            guard self.canDispatchRequest(generation: generation) else {
+                self.removeDispatchedRequest(id: request.id)
+                return
+            }
             _ = await self.handleRequest(
                 request,
                 sendResponse: true,
                 startedAt: startedAt
             )
+            self.removeDispatchedRequest(id: request.id)
         }
-        requestDispatchTail = task
+        requestDispatchTasks[request.id] = task
     }
 
-    private func canDispatchRequest() -> Bool {
-        return !isClosing
+    private func canDispatchRequest(generation: UInt64) -> Bool {
+        return !isClosing && generation == connectionGeneration
+    }
+
+    private func removeDispatchedRequest(id: ID) {
+        requestDispatchTasks[id] = nil
+    }
+
+    private func cancelDispatchedRequests() {
+        let tasks = requestDispatchTasks.values
+        requestDispatchTasks = [:]
+        for task in tasks {
+            task.cancel()
+        }
     }
 
     /// Send a notification to connected clients
@@ -575,6 +574,30 @@ public actor Server {
         for (_, request) in pendingRequestsToDrain {
             request.resume(throwing: error)
         }
+    }
+
+    private func markConnectionClosing() {
+        if !isClosing {
+            connectionGeneration &+= 1
+        }
+        isClosing = true
+    }
+
+    private func closeConnectionAfterTerminalEvent(throwing error: Swift.Error) async {
+        markConnectionClosing()
+        drainPendingResponses(throwing: error)
+        cancelDispatchedRequests()
+
+        let tasksToCancel = pendingRequestTasks.values
+        pendingRequestTasks = [:]
+        for task in tasksToCancel {
+            task.cancel()
+        }
+
+        if let connection = connection {
+            await connection.disconnect()
+        }
+        connection = nil
     }
 
     // MARK: - Sampling

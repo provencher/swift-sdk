@@ -709,8 +709,16 @@ public actor Client {
         // Create Batch actor, passing self (Client)
         let batch = Batch(client: self)
 
-        // Populate the batch actor by calling the user's closure.
-        try await body(batch)
+        // Populate the batch actor by calling the user's closure. If the body
+        // throws after registering requests, fail those continuations because no
+        // batch frame will be sent and no responses can arrive.
+        do {
+            try await body(batch)
+        } catch {
+            let requests = await batch.requests
+            failPendingRequests(ids: requests.map(\.id), throwing: error)
+            throw error
+        }
 
         // Get the collected requests from the batch actor
         let requests = await batch.requests

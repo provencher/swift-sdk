@@ -562,6 +562,46 @@ struct ClientTests {
         await client.disconnect()
     }
 
+    @Test("Batch body failure resumes registered pending requests")
+    func testBatchBodyFailureResumesRegisteredPendingRequests() async throws {
+        struct BodyFailure: Error {}
+
+        let transport = MockTransport()
+        let client = Client(name: "TestClient", version: "1.0")
+        try await connectInitialized(client, transport: transport)
+
+        let request = Ping.request(id: .number(2003))
+        nonisolated(unsafe) var resultTask: Task<Ping.Result, Swift.Error>?
+
+        do {
+            try await client.withBatch { batch in
+                resultTask = try await batch.addRequest(request)
+                throw BodyFailure()
+            }
+            #expect(Bool(false), "Expected batch body to throw")
+        } catch is BodyFailure {
+            #expect(Bool(true))
+        }
+
+        guard let resultTask else {
+            #expect(Bool(false), "Expected batch task to be registered before body failure")
+            await client.disconnect()
+            return
+        }
+
+        let result = await awaitResult {
+            try await resultTask.value
+        }
+        switch result {
+        case .success:
+            #expect(Bool(false), "Expected registered batch task to fail after body failure")
+        case .failure(let error):
+            #expect(error is BodyFailure)
+        }
+
+        await client.disconnect()
+    }
+
     @Test("Notify method sends notifications")
     func testClientNotify() async throws {
         let transport = MockTransport()

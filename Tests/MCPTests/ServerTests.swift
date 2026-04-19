@@ -3,6 +3,12 @@ import Testing
 
 @testable import MCP
 
+private struct SlowServerTestMethod: MCP.Method {
+    static let name = "test/slow"
+    typealias Parameters = Empty
+    typealias Result = Empty
+}
+
 @Suite("Server Tests")
 struct ServerTests {
     @Test("Start and stop server")
@@ -304,5 +310,103 @@ struct ServerTests {
         #expect(await transport.isConnected == false)
 
         await server.stop()
+    }
+
+    @Test("Long-running request does not block later request")
+    func testLongRunningRequestDoesNotBlockLaterRequest() async throws {
+        actor Counter {
+            private(set) var count = 0
+            func increment() { count += 1 }
+        }
+
+        let counter = Counter()
+        let transport = MockTransport()
+        let server = Server(name: "TestServer", version: "1.0")
+
+        await server.withMethodHandler(SlowServerTestMethod.self) { _ in
+            try await Task.sleep(for: .milliseconds(300))
+            return Empty()
+        }
+        await server.withMethodHandler(ListTools.self) { _ in
+            await counter.increment()
+            return ListTools.Result(tools: [])
+        }
+
+        try await transport.queue(request: SlowServerTestMethod.request(id: .number(1)))
+        try await transport.queue(request: ListTools.request(id: .number(2), .init()))
+
+        try await server.start(transport: transport)
+        try await Task.sleep(for: .milliseconds(100))
+
+        #expect(await counter.count == 1)
+
+        await server.stop()
+    }
+
+    @Test("Clean EOF drains server-initiated pending responses")
+    func testCleanEOFDrainsServerInitiatedPendingResponses() async throws {
+        let transport = MockTransport()
+        let server = Server(name: "TestServer", version: "1.0")
+        try await server.start(transport: transport)
+
+        let rootsTask = Task {
+            try await server.listRoots()
+        }
+
+        #expect(await waitForSentMessage(containing: ListRoots.name, transport: transport))
+        await transport.finishReceiving()
+
+        let result = await awaitResult {
+            try await rootsTask.value
+        }
+
+        switch result {
+        case .success:
+            #expect(Bool(false), "Expected pending server request to fail after clean EOF")
+        case .failure(let error as MCPError):
+            #expect(error == .connectionClosed)
+        case .failure(let error):
+            #expect(Bool(false), "Expected MCPError.connectionClosed, got \(error)")
+        }
+
+        #expect(await transport.isConnected == false)
+        await server.stop()
+    }
+
+    private func waitForSentMessage(
+        containing needle: String,
+        transport: MockTransport,
+        attempts: Int = 100
+    ) async -> Bool {
+        for _ in 0..<attempts {
+            if await transport.sentMessages.contains(where: { $0.contains(needle) }) {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return await transport.sentMessages.contains(where: { $0.contains(needle) })
+    }
+
+    private func awaitResult<T: Sendable>(
+        timeout: Duration = .milliseconds(500),
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async -> Result<T, Swift.Error> {
+        await withTaskGroup(of: Result<T, Swift.Error>.self) { group in
+            group.addTask {
+                do {
+                    return .success(try await operation())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return .failure(MCPError.internalError("Timed out waiting for result"))
+            }
+
+            let result = await group.next()!
+            group.cancelAll()
+            return result
+        }
     }
 }

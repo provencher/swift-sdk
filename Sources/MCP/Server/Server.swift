@@ -4,6 +4,34 @@ import struct Foundation.Data
 import struct Foundation.Date
 import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
+import protocol Foundation.LocalizedError
+
+private enum ResponseSendOutcome: Sendable {
+    case sent
+    case failed(MCPError)
+    case deadlineExceeded
+}
+
+private actor ResponseSendRace {
+    private var outcome: ResponseSendOutcome?
+    private var waiter: CheckedContinuation<ResponseSendOutcome, Never>?
+
+    func resolve(_ outcome: ResponseSendOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        waiter?.resume(returning: outcome)
+        waiter = nil
+    }
+
+    func wait() async -> ResponseSendOutcome {
+        if let outcome {
+            return outcome
+        }
+        return await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+}
 
 /// Model Context Protocol server
 public actor Server {
@@ -15,6 +43,11 @@ public actor Server {
         /// The strict configuration.
         public static let strict = Configuration(strict: true)
 
+        /// The maximum time allowed for delivering an encoded JSON-RPC response.
+        ///
+        /// A deadline expiry is connection-terminal because response delivery state is uncertain.
+        public var responseSendTimeout: Duration
+
         /// When strict mode is enabled, the server:
         /// - Requires clients to send an initialize request before any other requests
         /// - Rejects all requests from uninitialized clients with a protocol error
@@ -24,6 +57,33 @@ public actor Server {
         /// Disabling strict mode allows the server to be more lenient with non-compliant
         /// clients, though this may lead to undefined behavior.
         public var strict: Bool
+
+        public init(
+            strict: Bool = false,
+            responseSendTimeout: Duration = .seconds(30)
+        ) {
+            self.strict = strict
+            self.responseSendTimeout = responseSendTimeout
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case strict
+            case responseSendTimeout
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            strict = try container.decodeIfPresent(Bool.self, forKey: .strict) ?? false
+            responseSendTimeout =
+                try container.decodeIfPresent(Duration.self, forKey: .responseSendTimeout)
+                ?? .seconds(30)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(strict, forKey: .strict)
+            try container.encode(responseSendTimeout, forKey: .responseSendTimeout)
+        }
     }
 
     /// Implementation information
@@ -161,6 +221,11 @@ public actor Server {
     /// The server configuration
     public var configuration: Configuration
 
+    private var responseSendDeadlineSleep: @Sendable (Duration) async throws -> Void = {
+        duration in
+        try await Task.sleep(for: duration)
+    }
+
     /// Request handlers
     private var methodHandlers: [String: RequestHandlerBox] = [:]
     /// Notification handlers
@@ -172,6 +237,8 @@ public actor Server {
     private var pendingRequests: [ID: AnyPendingRequest] = [:]
     /// Terminal flag set after response delivery fails or stop begins.
     private var isClosing = false
+    /// Shared teardown task so concurrent terminal callers wait for the same disconnect.
+    private var connectionCloseTask: Task<Void, Never>?
 
     private struct ResponseSendContext: Sendable {
         let phase: String
@@ -221,6 +288,11 @@ public actor Server {
         transport: any Transport,
         initializeHook: (@Sendable (Client.Info, Client.Capabilities) async throws -> Void)? = nil
     ) async throws {
+        if let connectionCloseTask {
+            await connectionCloseTask.value
+            self.connectionCloseTask = nil
+        }
+
         self.connection = transport
         self.isClosing = false
         self.connectionGeneration &+= 1
@@ -324,6 +396,12 @@ public actor Server {
         await task?.value
     }
 
+    func setResponseSendDeadlineSleepForTesting(
+        _ sleep: @escaping @Sendable (Duration) async throws -> Void
+    ) {
+        responseSendDeadlineSleep = sleep
+    }
+
     // MARK: - Request Context
 
     /// The JSON-RPC request ID of the currently executing method handler.
@@ -364,18 +442,36 @@ public actor Server {
 
     /// Send a response to a request
     public func send<M: Method>(_ response: Response<M>) async throws {
-        if isClosing {
+        let startedAt = Date()
+        let context = ResponseSendContext(
+            phase: "public_response",
+            requestID: response.id,
+            method: nil,
+            toolName: nil,
+            responseCount: 1,
+            startedAt: startedAt
+        )
+
+        let responseData: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            responseData = try encoder.encode(response)
+        } catch {
+            await handleResponseSendFailure(
+                error,
+                provenance: "response_encode_failed",
+                context: context,
+                byteCount: nil,
+                sendStartedAt: startedAt
+            )
             throw MCPError.connectionClosed
         }
-        guard let connection = connection else {
-            throw MCPError.internalError("Server connection not initialized")
+
+        let sent = await sendResponseData(responseData, context: context)
+        if !sent {
+            throw MCPError.connectionClosed
         }
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-
-        let responseData = try encoder.encode(response)
-        try await connection.send(responseData)
     }
 
     private func sendResponse(
@@ -388,39 +484,107 @@ public actor Server {
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             responseData = try encoder.encode(response)
         } catch {
-            await handleResponseSendFailure(error, context: context, byteCount: nil)
+            await handleResponseSendFailure(
+                error,
+                provenance: "response_send_failed",
+                context: context,
+                byteCount: nil,
+                sendStartedAt: context.startedAt
+            )
             return false
         }
 
+        return await sendResponseData(responseData, context: context)
+    }
+
+    private func sendResponseData(
+        _ responseData: Data,
+        context: ResponseSendContext
+    ) async -> Bool {
         guard !isClosing else {
             return false
         }
-        guard let connection = connection else {
-            await handleResponseSendFailure(MCPError.connectionClosed, context: context, byteCount: responseData.count)
+        guard let connection else {
+            await handleResponseSendFailure(
+                MCPError.connectionClosed,
+                provenance: "response_send_failed",
+                context: context,
+                byteCount: responseData.count,
+                sendStartedAt: Date()
+            )
             return false
         }
 
-        do {
-            try await connection.send(responseData)
-            return true
-        } catch {
-            await handleResponseSendFailure(error, context: context, byteCount: responseData.count)
-            return false
+        let sendStartedAt = Date()
+        let race = ResponseSendRace()
+        let timeout = configuration.responseSendTimeout
+        let deadlineSleep = responseSendDeadlineSleep
+
+        let sendTask = Task {
+            do {
+                try await connection.send(responseData)
+                await race.resolve(.sent)
+            } catch let error as MCPError {
+                await race.resolve(.failed(error))
+            } catch {
+                await race.resolve(.failed(MCPError.transportError(error)))
+            }
         }
+        let deadlineTask = Task {
+            do {
+                try await deadlineSleep(timeout)
+                await race.resolve(.deadlineExceeded)
+            } catch {
+                // Cancellation means response delivery completed before the deadline.
+            }
+        }
+
+        let outcome = await race.wait()
+        sendTask.cancel()
+        deadlineTask.cancel()
+
+        switch outcome {
+        case .sent:
+            return true
+        case .failed(let error):
+            await handleResponseSendFailure(
+                error,
+                provenance: "response_send_failed",
+                context: context,
+                byteCount: responseData.count,
+                sendStartedAt: sendStartedAt
+            )
+        case .deadlineExceeded:
+            await handleResponseSendFailure(
+                MCPError.transportError(ResponseSendDeadlineExceeded(timeout: timeout)),
+                provenance: "response_send_deadline_exceeded",
+                context: context,
+                byteCount: responseData.count,
+                sendStartedAt: sendStartedAt,
+                timeout: timeout
+            )
+        }
+        return false
     }
 
     private func handleResponseSendFailure(
         _ error: Swift.Error,
+        provenance: String,
         context: ResponseSendContext,
-        byteCount: Int?
+        byteCount: Int?,
+        sendStartedAt: Date,
+        timeout: Duration? = nil
     ) async {
         var metadata: Logger.Metadata = [
-            "provenance": "response_send_failed",
+            "provenance": "\(provenance)",
             "phase": "\(context.phase)",
             "response_count": "\(context.responseCount)",
-            "elapsed_seconds": "\(Date().timeIntervalSince(context.startedAt))",
-            "error": "\(error)",
+            "elapsed_seconds": "\(Date().timeIntervalSince(sendStartedAt))",
+            "error_type": "\(String(reflecting: type(of: error)))",
         ]
+        if let mcpError = error as? MCPError {
+            metadata["error_code"] = "\(mcpError.code)"
+        }
         if let requestID = context.requestID {
             metadata["id"] = "\(requestID)"
         }
@@ -433,10 +597,26 @@ public actor Server {
         if let byteCount = byteCount {
             metadata["bytes"] = "\(byteCount)"
         }
+        if let timeout {
+            metadata["timeout_seconds"] = "\(Self.seconds(in: timeout))"
+        }
 
         await logger?.error("Failed to send JSON-RPC response", metadata: metadata)
 
         await closeConnectionAfterTerminalEvent(throwing: MCPError.connectionClosed)
+    }
+
+    private static func seconds(in duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
+    }
+
+    private struct ResponseSendDeadlineExceeded: LocalizedError, Sendable {
+        let timeout: Duration
+
+        var errorDescription: String? {
+            "JSON-RPC response send exceeded \(Server.seconds(in: timeout)) seconds"
+        }
     }
 
     private func toolName(from request: Request<AnyMethod>) -> String? {
@@ -584,7 +764,16 @@ public actor Server {
     }
 
     private func closeConnectionAfterTerminalEvent(throwing error: Swift.Error) async {
+        if let connectionCloseTask {
+            await connectionCloseTask.value
+            return
+        }
+        guard !isClosing else { return }
+
         markConnectionClosing()
+        let connectionToClose = connection
+        connection = nil
+
         drainPendingResponses(throwing: error)
         cancelDispatchedRequests()
 
@@ -594,10 +783,14 @@ public actor Server {
             task.cancel()
         }
 
-        if let connection = connection {
-            await connection.disconnect()
+        let closeTask = Task {
+            if let connectionToClose {
+                await connectionToClose.disconnect()
+            }
         }
-        connection = nil
+        connectionCloseTask = closeTask
+        await closeTask.value
+        connectionCloseTask = nil
     }
 
     // MARK: - Sampling
@@ -892,6 +1085,7 @@ public actor Server {
             } catch {
                 await handleResponseSendFailure(
                     error,
+                    provenance: "response_send_failed",
                     context: ResponseSendContext(
                         phase: "batch_response_encode",
                         requestID: nil,
@@ -900,42 +1094,24 @@ public actor Server {
                         responseCount: responses.count,
                         startedAt: startedAt
                     ),
-                    byteCount: nil
+                    byteCount: nil,
+                    sendStartedAt: startedAt
                 )
                 return false
             }
 
-            guard let connection = connection else {
-                await handleResponseSendFailure(
-                    MCPError.connectionClosed,
-                    context: ResponseSendContext(
-                        phase: "batch_response",
-                        requestID: nil,
-                        method: nil,
-                        toolName: nil,
-                        responseCount: responses.count,
-                        startedAt: startedAt
-                    ),
-                    byteCount: responseData.count
+            let sent = await sendResponseData(
+                responseData,
+                context: ResponseSendContext(
+                    phase: "batch_response",
+                    requestID: nil,
+                    method: nil,
+                    toolName: nil,
+                    responseCount: responses.count,
+                    startedAt: startedAt
                 )
-                return false
-            }
-
-            do {
-                try await connection.send(responseData)
-            } catch {
-                await handleResponseSendFailure(
-                    error,
-                    context: ResponseSendContext(
-                        phase: "batch_response",
-                        requestID: nil,
-                        method: nil,
-                        toolName: nil,
-                        responseCount: responses.count,
-                        startedAt: startedAt
-                    ),
-                    byteCount: responseData.count
-                )
+            )
+            if !sent {
                 return false
             }
         }

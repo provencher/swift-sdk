@@ -1,7 +1,199 @@
 import Foundation
+import Logging
 import Testing
 
 @testable import MCP
+
+private actor ResponseDeliveryRequestGate {
+    private var arrived: Set<ID> = []
+    private var arrivalWaiters: [(Set<ID>, CheckedContinuation<Void, Never>)] = []
+    private var released: Set<ID> = []
+    private var releaseWaiters: [ID: [Int: CheckedContinuation<Void, Swift.Error>]] = [:]
+    private var nextToken = 0
+
+    func enter(id: ID) async throws {
+        arrived.insert(id)
+        resumeSatisfiedArrivalWaiters()
+        if released.contains(id) { return }
+
+        let token = nextToken
+        nextToken += 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Swift.Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if released.contains(id) {
+                    continuation.resume()
+                } else {
+                    releaseWaiters[id, default: [:]][token] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id, token: token) }
+        }
+    }
+
+    func waitUntilArrived(_ ids: Set<ID>) async {
+        if ids.isSubset(of: arrived) { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiters.append((ids, continuation))
+        }
+    }
+
+    func release(id: ID) {
+        released.insert(id)
+        let waiters = releaseWaiters.removeValue(forKey: id) ?? [:]
+        for waiter in waiters.values {
+            waiter.resume()
+        }
+    }
+
+    func hasArrived(_ id: ID) -> Bool {
+        arrived.contains(id)
+    }
+
+    private func cancel(id: ID, token: Int) {
+        guard let waiter = releaseWaiters[id]?.removeValue(forKey: token) else { return }
+        if releaseWaiters[id]?.isEmpty == true {
+            releaseWaiters[id] = nil
+        }
+        waiter.resume(throwing: CancellationError())
+    }
+
+    private func resumeSatisfiedArrivalWaiters() {
+        var remaining: [(Set<ID>, CheckedContinuation<Void, Never>)] = []
+        for (ids, waiter) in arrivalWaiters {
+            if ids.isSubset(of: arrived) {
+                waiter.resume()
+            } else {
+                remaining.append((ids, waiter))
+            }
+        }
+        arrivalWaiters = remaining
+    }
+}
+
+private actor ManualResponseSendDeadline {
+    private var sleepers: [Int: CheckedContinuation<Void, Swift.Error>] = [:]
+    private var armedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextToken = 0
+
+    func sleep(for _: Duration) async throws {
+        let token = nextToken
+        nextToken += 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Swift.Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    sleepers[token] = continuation
+                    let waiters = armedWaiters
+                    armedWaiters = []
+                    for waiter in waiters {
+                        waiter.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(token: token) }
+        }
+    }
+
+    func waitUntilArmed() async {
+        if !sleepers.isEmpty { return }
+        await withCheckedContinuation { continuation in
+            armedWaiters.append(continuation)
+        }
+    }
+
+    func expire() {
+        let sleepers = sleepers
+        self.sleepers = [:]
+        for sleeper in sleepers.values {
+            sleeper.resume()
+        }
+    }
+
+    private func cancel(token: Int) {
+        sleepers.removeValue(forKey: token)?.resume(throwing: CancellationError())
+    }
+}
+
+private enum ClientWaitOutcome: Equatable, Sendable {
+    case success
+    case mcpError(MCPError)
+    case cancelled
+    case other(String)
+}
+
+private func observeClientWaiter(
+    _ context: RequestContext<CallTool.Result>
+) async -> ClientWaitOutcome {
+    do {
+        _ = try await context.value
+        return .success
+    } catch let error as MCPError {
+        return .mcpError(error)
+    } catch is CancellationError {
+        return .cancelled
+    } catch {
+        return .other(String(describing: error))
+    }
+}
+
+private final class ServerTestLogRecorder: @unchecked Sendable {
+    struct Entry: Sendable {
+        let message: String
+        let metadata: [String: String]
+    }
+
+    private let lock = NSLock()
+    private var storedEntries: [Entry] = []
+
+    func record(message: String, metadata: Logger.Metadata) {
+        lock.lock()
+        storedEntries.append(
+            Entry(
+                message: message,
+                metadata: metadata.mapValues { String(describing: $0) }
+            )
+        )
+        lock.unlock()
+    }
+
+    func entries() -> [Entry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedEntries
+    }
+}
+
+private struct ServerTestLogHandler: LogHandler {
+    var metadata: Logger.Metadata = [:]
+    var logLevel: Logger.Level = .trace
+    let recorder: ServerTestLogRecorder
+
+    subscript(metadataKey key: String) -> Logger.Metadata.Value? {
+        get { metadata[key] }
+        set { metadata[key] = newValue }
+    }
+
+    func log(
+        level _: Logger.Level,
+        message: Logger.Message,
+        metadata explicitMetadata: Logger.Metadata?,
+        source _: String,
+        file _: String,
+        function _: String,
+        line _: UInt
+    ) {
+        var combinedMetadata = metadata
+        if let explicitMetadata {
+            combinedMetadata.merge(explicitMetadata, uniquingKeysWith: { _, new in new })
+        }
+        recorder.record(message: String(describing: message), metadata: combinedMetadata)
+    }
+}
 
 private struct SlowServerTestMethod: MCP.Method {
     static let name = "test/slow"
@@ -221,6 +413,220 @@ struct ServerTests {
         await server.stop()
         await clientTransport.disconnect()
         await serverTransport.disconnect()
+    }
+
+    @Test(
+        "Typed response send failure closes connection and drains all client waiters",
+        .timeLimit(.minutes(1))
+    )
+    func testTypedResponseSendFailureClosesConnectionAndDrainsClientWaiters() async throws {
+        let recorder = ServerTestLogRecorder()
+        let logger = Logger(label: "mcp.test.response-failure") { _ in
+            ServerTestLogHandler(recorder: recorder)
+        }
+        let (clientTransport, serverTransport) = await MockTransport.createConnectedPair(
+            logger: logger
+        )
+        let server = Server(name: "TestServer", version: "1.0")
+        let client = Client(name: "TestClient", version: "1.0")
+
+        try await server.start(transport: serverTransport)
+        _ = try await client.connect(transport: clientTransport)
+
+        let gate = ResponseDeliveryRequestGate()
+        await server.withMethodHandler(CallTool.self) { _ in
+            guard let requestID = Server.currentRequestID else {
+                throw MCPError.internalError("Missing request ID")
+            }
+            try await gate.enter(id: requestID)
+            return CallTool.Result()
+        }
+
+        let selectedID = ID.number(102)
+        await serverTransport.setResponseSendFault(
+            .init(
+                id: selectedID,
+                method: CallTool.name,
+                toolName: "response-delivery-test",
+                behavior: .throwError(message: "transport-secret-must-not-be-logged")
+            )
+        )
+
+        let requestIDs = Set((101...105).map(ID.number))
+        var contexts: [ID: RequestContext<CallTool.Result>] = [:]
+        for requestID in requestIDs {
+            contexts[requestID] = try await client.send(
+                CallTool.request(
+                    id: requestID,
+                    .init(
+                        name: "response-delivery-test",
+                        arguments: ["secret": .string("payload-must-not-be-logged")]
+                    )
+                )
+            )
+        }
+        let observers = contexts.mapValues { context in
+            Task { await observeClientWaiter(context) }
+        }
+
+        await gate.waitUntilArrived(requestIDs)
+        await gate.release(id: selectedID)
+        await serverTransport.waitUntilResponseSendStarted(id: selectedID)
+
+        for requestID in requestIDs {
+            #expect(await observers[requestID]?.value == .mcpError(.connectionClosed))
+        }
+        await server.waitUntilCompleted()
+
+        #expect(await serverTransport.responseSendAttemptCount(for: selectedID) == 1)
+        #expect(await serverTransport.disconnectCallCount == 1)
+        #expect(await serverTransport.sentMessages.contains(where: { $0.contains("\"id\":102") }) == false)
+
+        let failureEntry = recorder.entries().first(where: {
+            $0.metadata["provenance"] == "response_send_failed"
+                && $0.metadata["id"] == "102"
+        })
+        #expect(failureEntry?.metadata["error_code"] == "-32001")
+        #expect(failureEntry?.metadata["error_type"]?.contains("MCPError") == true)
+        #expect(failureEntry?.metadata.values.contains(where: {
+            $0.contains("transport-secret-must-not-be-logged")
+                || $0.contains("payload-must-not-be-logged")
+        }) == false)
+
+        do {
+            _ = try await client.send(
+                CallTool.request(
+                    id: .number(106),
+                    .init(name: "response-delivery-test")
+                )
+            )
+            Issue.record("Expected request 106 to be rejected after terminal response failure")
+        } catch let error as MCPError {
+            #expect(error == .connectionClosed)
+        }
+        #expect(await gate.hasArrived(.number(106)) == false)
+
+        await client.disconnect()
+        await server.stop()
+    }
+
+    @Test(
+        "Typed suspended response send expires deadline and drains all client waiters",
+        .timeLimit(.minutes(1))
+    )
+    func testTypedSuspendedResponseSendExpiresDeadlineAndDrainsClientWaiters() async throws {
+        let recorder = ServerTestLogRecorder()
+        let logger = Logger(label: "mcp.test.response-deadline") { _ in
+            ServerTestLogHandler(recorder: recorder)
+        }
+        let (clientTransport, serverTransport) = await MockTransport.createConnectedPair(
+            logger: logger
+        )
+        let configuration = Server.Configuration(responseSendTimeout: .seconds(30))
+        let legacyConfiguration = try JSONDecoder().decode(
+            Server.Configuration.self,
+            from: Data(#"{"strict":true}"#.utf8)
+        )
+        #expect(Server.Configuration.default.responseSendTimeout == .seconds(30))
+        #expect(configuration.responseSendTimeout == .seconds(30))
+        #expect(legacyConfiguration.strict == true)
+        #expect(legacyConfiguration.responseSendTimeout == .seconds(30))
+
+        let server = Server(
+            name: "TestServer",
+            version: "1.0",
+            configuration: configuration
+        )
+        let deadline = ManualResponseSendDeadline()
+        let client = Client(name: "TestClient", version: "1.0")
+
+        try await server.start(transport: serverTransport)
+        _ = try await client.connect(transport: clientTransport)
+        await server.setResponseSendDeadlineSleepForTesting { duration in
+            try await deadline.sleep(for: duration)
+        }
+
+        let gate = ResponseDeliveryRequestGate()
+        await server.withMethodHandler(CallTool.self) { _ in
+            guard let requestID = Server.currentRequestID else {
+                throw MCPError.internalError("Missing request ID")
+            }
+            try await gate.enter(id: requestID)
+            return CallTool.Result()
+        }
+
+        let selectedID = ID.number(102)
+        await serverTransport.setResponseSendFault(
+            .init(
+                id: selectedID,
+                method: CallTool.name,
+                toolName: "response-delivery-test",
+                behavior: .suspend
+            )
+        )
+
+        let requestIDs = Set((101...105).map(ID.number))
+        var contexts: [ID: RequestContext<CallTool.Result>] = [:]
+        for requestID in requestIDs {
+            contexts[requestID] = try await client.send(
+                CallTool.request(
+                    id: requestID,
+                    .init(
+                        name: "response-delivery-test",
+                        arguments: ["secret": .string("payload-must-not-be-logged")]
+                    )
+                )
+            )
+        }
+        let observers = contexts.mapValues { context in
+            Task { await observeClientWaiter(context) }
+        }
+
+        await gate.waitUntilArrived(requestIDs)
+        await gate.release(id: selectedID)
+        await serverTransport.waitUntilResponseSendStarted(id: selectedID)
+        await deadline.waitUntilArmed()
+        await deadline.expire()
+
+        for requestID in requestIDs {
+            #expect(await observers[requestID]?.value == .mcpError(.connectionClosed))
+        }
+        await server.waitUntilCompleted()
+
+        #expect(await serverTransport.responseSendAttemptCount(for: selectedID) == 1)
+        #expect(await serverTransport.disconnectCallCount == 1)
+
+        let deadlineEntry = recorder.entries().first(where: {
+            $0.metadata["provenance"] == "response_send_deadline_exceeded"
+        })
+        #expect(deadlineEntry?.message == "Failed to send JSON-RPC response")
+        #expect(deadlineEntry?.metadata["id"] == "102")
+        #expect(deadlineEntry?.metadata["method"] == CallTool.name)
+        #expect(deadlineEntry?.metadata["tool"] == "response-delivery-test")
+        #expect(deadlineEntry?.metadata["phase"] == "single_response")
+        #expect(deadlineEntry?.metadata["response_count"] == "1")
+        #expect(deadlineEntry?.metadata["timeout_seconds"] == "30.0")
+        #expect(Int(deadlineEntry?.metadata["bytes"] ?? "") != nil)
+        #expect(Double(deadlineEntry?.metadata["elapsed_seconds"] ?? "") != nil)
+        #expect(deadlineEntry?.metadata.values.contains(where: {
+            $0.contains("payload-must-not-be-logged")
+        }) == false)
+
+        do {
+            _ = try await client.send(
+                CallTool.request(
+                    id: .number(106),
+                    .init(name: "response-delivery-test")
+                )
+            )
+            Issue.record("Expected request 106 to be rejected after response deadline expiry")
+        } catch let error as MCPError {
+            #expect(error == .connectionClosed)
+        }
+        #expect(await gate.hasArrived(.number(106)) == false)
+
+        await client.disconnect()
+        await server.stop()
     }
 
     @Test("Response send failure after handler success is single-attempt and terminal")
